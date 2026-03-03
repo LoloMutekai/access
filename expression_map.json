@@ -1,0 +1,31 @@
+{
+  "BASE_NEUTRAL": {
+    "main": "Fcl_ALL_Neutral",
+    "overlay": []
+  },
+
+  "POSITIVE_LOW": {
+    "main": "Fcl_ALL_Joy",
+    "overlay": ["Fcl_EYE_Joy"]
+  },
+
+  "POSITIVE_HIGH": {
+    "main": "Fcl_ALL_Fun",
+    "overlay": ["Fcl_EYE_Fun", "Fcl_BRW_Fun"]
+  },
+
+  "NEGATIVE_HIGH": {
+    "main": "Fcl_ALL_Angry",
+    "overlay": ["Fcl_BRW_Angry", "Fcl_MTH_Angry"]
+  },
+
+  "NEGATIVE_LOW": {
+    "main": "Fcl_ALL_Sorrow",
+    "overlay": ["Fcl_EYE_Sorrow"]
+  },
+
+  "SURPRISE": {
+    "main": "Fcl_ALL_Surprised",
+    "overlay": ["Fcl_EYE_Spread"]
+  }
+}

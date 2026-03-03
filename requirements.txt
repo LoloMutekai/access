@@ -1,0 +1,5 @@
+# A.C.C.E.S.S. — Memory Layer dependencies
+faiss-cpu==1.8.0
+sentence-transformers==3.0.1
+numpy>=1.24.0
+# SQLite is built into Python stdlib — no package needed
