@@ -1,0 +1,1 @@
+collect_ignore = ["agent/test_generator.py"]
