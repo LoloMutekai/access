@@ -1,5 +1,5 @@
 """
-A.C.C.E.S.S. — BiometricEngine (Phase 7.9.0 — TRAINING ADVICE)
+A.C.C.E.S.S. — BiometricEngine (Phase 7.10.0 — DATA ENGINE INTEGRATION)
 
 Deterministic biometric signal processor conforming to the DomainEngine contract.
 
@@ -17,6 +17,14 @@ Architecture:
         ├── compute_training_state()   — priority-rule training state classifier
         └── compute_recommended_load() — load multiplier in [0, 1] for training state
         └── compute_training_advice()  — structured TrainingRecommendation dataclass
+
+    Optional DataEngine integration (Phase 7.10.0)
+    -----------------------------------------------
+    BiometricEngine(data_engine=<engine>) accepts any object that implements
+    ``run({"values": list[float]}) → dict``.  When provided it is called on the
+    ``"load"`` channel inside ``process()`` and the extracted features are
+    surfaced under the top-level ``"data_features"`` key of the output dict.
+    When no engine is provided ``"data_features"`` is always ``{}``.
 
     Module-level functions (also exposed as engine methods):
         compute_training_state(metrics)          → str
@@ -38,7 +46,8 @@ Backward compatibility:
     7.5.0 -> 7.6.0 : added "anomaly_score"; AnomalyResult + compute_anomaly()
     7.6.0 -> 7.7.0 : added "training_state"; compute_training_state() + module fn
     7.7.0 -> 7.8.0 : added "recommended_load"; compute_recommended_load() + module fn
-    7.8.0 -> 7.9.0 : added "training_advice"; TrainingRecommendation + compute_training_advice()
+    7.8.0 -> 7.9.0  : added "training_advice"; TrainingRecommendation + compute_training_advice()
+    7.9.0 -> 7.10.0 : optional DataEngine integration; top-level "data_features" key in output
     All prior keys are unchanged in position and semantics.
 
 Input schema
@@ -49,32 +58,32 @@ Input schema
         "load": list[float],   # training-load samples (AU)   — length >= 10
     }
 
-Output schema (v7.9.0)
+Output schema (v7.10.0)
 -----------------------
     {
         "status":  "ok" | "error",
         "metrics": {
-            "mean_hr":          float,   # arithmetic mean of clean HR (bpm)
-            "mean_hrv":         float,   # arithmetic mean of clean HRV (ms)
-            "load_mean":        float,   # arithmetic mean of clean load (AU)
-            "hr_std":           float,   # population std-dev of clean HR
-            "hrv_std":          float,   # population std-dev of clean HRV
-            "fatigue_index":    float,   # sigmoid fatigue score in [0, 1]
-            "drift_score":      float,   # weighted drift score in [0, 1]
-            "injury_risk":      float,   # weighted injury risk in [0, 1]
-            "anomaly_score":    float,   # weighted anomaly score in [0, 1]
-            "training_state":   str,     # one of {"FULL","CAUTION","LIGHT","RECOVERY"}
-            "recommended_load": float,   # load multiplier in [0, 1]
-            "training_advice":  {        # structured recommendation          <-- NEW
-                "state":            str,   # mirrors training_state
-                "recommended_load": float, # mirrors recommended_load
-            },
+            "mean_hr":          float,
+            "mean_hrv":         float,
+            "load_mean":        float,
+            "hr_std":           float,
+            "hrv_std":          float,
+            "fatigue_index":    float,
+            "drift_score":      float,
+            "injury_risk":      float,
+            "anomaly_score":    float,
+            "training_state":   str,
+            "recommended_load": float,
+            "training_advice":  {"state": str, "recommended_load": float},
         } | null,
+        "data_features": dict,   # DataEngine features on load channel  <-- NEW 7.10.0
+                                 # always present; {} when no data_engine configured
         "engine":  "BiometricEngine",
-        "version": "7.9.0",
+        "version": "7.10.0",
     }
 
-    On error: "metrics" is null, an "error" key carries the message.
+    On error: "metrics" is null, "error" carries the message.
+    "data_features" is always present (empty dict on error or when no data_engine).
 
 Fatigue model (unchanged from 7.3.1)
 --------------------------------------
@@ -173,22 +182,26 @@ Training advice model (new in 7.9.0)
 
 Usage
 -----
+    # No DataEngine — data_features is always {}
     engine = BiometricEngine()
     result = engine.process({"hr": [...], "hrv": [...], "load": [...]})
     assert result["status"] == "ok"
-    print(result["metrics"]["training_advice"])   # {"state": ..., "recommended_load": ...}  <-- NEW
-    print(result["metrics"]["recommended_load"])  # float in [0, 1]
+    assert result["data_features"] == {}
+    print(result["metrics"]["training_advice"])   # {"state": ..., "recommended_load": ...}
     print(result["metrics"]["training_state"])    # str in VALID_TRAINING_STATES
-    print(result["metrics"]["anomaly_score"])     # float in [0, 1]
-    print(result["metrics"]["injury_risk"])       # float in [0, 1]
-    print(result["metrics"]["drift_score"])       # float in [0, 1]
+
+    # With optional DataEngine (duck-typed, must implement run())
+    from agent.domain.data_engine import DataEngine
+    engine = BiometricEngine(data_engine=DataEngine())
+    result = engine.process({"hr": [...], "hrv": [...], "load": [...]})
+    print(result["data_features"])                # dict of load-channel features  <-- NEW
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 
 # =============================================================================
@@ -196,7 +209,7 @@ from typing import Any
 # =============================================================================
 
 ENGINE_NAME: str = "BiometricEngine"
-ENGINE_VERSION: str = "7.9.0"
+ENGINE_VERSION: str = "7.10.0"
 
 #: Minimum number of valid (finite) samples required per channel after cleaning.
 MIN_SAMPLES: int = 10
@@ -723,15 +736,43 @@ class BiometricEngine:
     """
     Deterministic, stateless biometric signal processor.
 
-    The engine holds NO mutable state.  Every public method is a pure
-    function of its arguments plus the frozen BiometricConfig.
+    The engine holds NO mutable state beyond the injected ``data_engine``
+    reference.  Every public method is a pure function of its arguments
+    plus the frozen ``BiometricConfig``.
 
-    Thread-safety: all methods are safe to call concurrently because no
-    shared mutable state exists.
+    Thread-safety: safe to call concurrently — no shared mutable state.
+
+    Optional DataEngine integration
+    --------------------------------
+    Pass any object that implements ``run({"values": list[float]}) → dict``
+    as ``data_engine``.  When provided it is called on the ``"load"`` channel
+    inside ``process()`` and the returned ``"features"`` dict is surfaced as
+    ``result["data_features"]``.  If the engine raises or returns an
+    unexpected value, ``data_features`` silently falls back to ``{}`` so the
+    biometric pipeline always succeeds.
     """
 
-    def __init__(self, config: BiometricConfig | None = None) -> None:
-        self._cfg = config or BiometricConfig()
+    def __init__(
+        self,
+        config: BiometricConfig | None = None,
+        data_engine: Optional[Any] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        config : BiometricConfig | None
+            Engine thresholds.  Uses ``BiometricConfig()`` defaults if None.
+        data_engine : object | None
+            Optional time-series feature extractor.  Must implement::
+
+                run({"values": list[float]}) -> {"features": dict, ...}
+
+            Duck-typed — no ABC coupling with ``agent.domain``.
+            Defaults to ``None``; ``data_features`` will be ``{}`` in all
+            output dicts when not provided.
+        """
+        self._cfg         = config or BiometricConfig()
+        self._data_engine = data_engine
 
     # -------------------------------------------------------------------------
     # PUBLIC API — DomainEngine contract
@@ -749,32 +790,44 @@ class BiometricEngine:
                                            -> compute_training_state
                                            -> compute_recommended_load
                                            -> compute_training_advice
+                                      [opt: data_engine.run() on load channel]
 
         Returns a JSON-serialisable dict conforming to the output schema.
         Never raises — all errors are captured in the returned dict.
+
+        ``"data_features"`` is always present in the output (top-level key,
+        separate from ``"metrics"``).  It is ``{}`` when no ``data_engine``
+        is configured.
         """
+        # Run the optional DataEngine *before* the biometric pipeline so
+        # that any exception it raises is fully isolated from the core path.
+        data_features: dict = self._extract_data_features(raw)
+
         try:
             self.validate_schema(raw)
-            cleaned  = self.clean_data(raw)
+            cleaned    = self.clean_data(raw)
             normalized = self.normalize(cleaned)
-            metrics  = self.compute_core_metrics(cleaned)
-            fatigue  = self.compute_fatigue_index(metrics, normalized)
-            drift    = self.compute_drift(metrics, fatigue)
-            risk     = self.compute_injury_risk(metrics, fatigue, drift)
-            signals  = self.compute_anomaly_signals(metrics, fatigue, drift)
-            anomaly  = self.compute_anomaly(signals)
-            state    = self.compute_training_state(
+            metrics    = self.compute_core_metrics(cleaned)
+            fatigue    = self.compute_fatigue_index(metrics, normalized)
+            drift      = self.compute_drift(metrics, fatigue)
+            risk       = self.compute_injury_risk(metrics, fatigue, drift)
+            signals    = self.compute_anomaly_signals(metrics, fatigue, drift)
+            anomaly    = self.compute_anomaly(signals)
+            state      = self.compute_training_state(
                 self._build_score_dict(fatigue, risk, anomaly)
             )
-            rec_load = self.compute_recommended_load(state)
-            advice   = self.compute_training_advice(
+            rec_load   = self.compute_recommended_load(state)
+            advice     = self.compute_training_advice(
                 self._build_score_dict(fatigue, risk, anomaly)
             )
-            return self._ok(metrics, fatigue, drift, risk, anomaly, state, rec_load, advice)
+            return self._ok(
+                metrics, fatigue, drift, risk, anomaly,
+                state, rec_load, advice, data_features,
+            )
         except SchemaError as exc:
-            return self._error(str(exc))
+            return self._error(str(exc), data_features)
         except Exception as exc:  # pragma: no cover — safety net
-            return self._error(f"internal: {exc}")
+            return self._error(f"internal: {exc}", data_features)
 
     def validate_schema(self, raw: dict[str, Any]) -> None:
         """
@@ -1274,6 +1327,46 @@ class BiometricEngine:
         """
         return compute_training_advice(metrics)
 
+    # ── DataEngine integration ────────────────────────────────────────────────
+
+    def _extract_data_features(self, raw: Any) -> dict:
+        """
+        Call the optional DataEngine on the ``"load"`` channel of ``raw``.
+
+        Returns
+        -------
+        dict
+            The ``"features"`` sub-dict from the DataEngine result, or ``{}``
+            when:
+
+            - no ``data_engine`` is configured,
+            - ``raw`` is not a dict or has no ``"load"`` key,
+            - the DataEngine call raises any exception, or
+            - the DataEngine result is not a dict.
+
+        Guarantees
+        ----------
+        - ``raw`` is never mutated.
+        - All exceptions from the DataEngine are silently swallowed; a
+          faulty engine can never break the biometric pipeline.
+        - The returned dict is always a shallow copy so mutations by the
+          caller cannot affect the DataEngine's internal state.
+        """
+        if self._data_engine is None:
+            return {}
+        try:
+            if not isinstance(raw, dict) or "load" not in raw:
+                return {}
+            # Build a fresh one-key dict — never pass raw directly to avoid
+            # the DataEngine seeing (and potentially mutating) extra channels.
+            de_result = self._data_engine.run({"values": list(raw["load"])})
+            if not isinstance(de_result, dict):
+                return {}
+            features = de_result.get("features", {})
+            return dict(features) if isinstance(features, dict) else {}
+        except Exception:
+            return {}
+
     @staticmethod
     def _build_score_dict(
         fatigue: FatigueResult,
@@ -1297,6 +1390,7 @@ class BiometricEngine:
         state: str,
         rec_load: float,
         advice: TrainingRecommendation,
+        data_features: dict,
     ) -> dict[str, Any]:
         output = metrics.to_dict()
         output.update(fatigue.to_dict())          # adds "fatigue_index"
@@ -1307,17 +1401,19 @@ class BiometricEngine:
         output["recommended_load"] = rec_load           # adds "recommended_load"
         output["training_advice"]  = advice.to_dict()  # adds "training_advice"
         return {
-            "status":  "ok",
-            "metrics": output,
-            "engine":  ENGINE_NAME,
-            "version": ENGINE_VERSION,
+            "status":        "ok",
+            "metrics":       output,
+            "data_features": data_features,       # {} when no data_engine
+            "engine":        ENGINE_NAME,
+            "version":       ENGINE_VERSION,
         }
 
-    def _error(self, message: str) -> dict[str, Any]:
+    def _error(self, message: str, data_features: dict | None = None) -> dict[str, Any]:
         return {
-            "status":  "error",
-            "metrics": None,
-            "error":   message,
-            "engine":  ENGINE_NAME,
-            "version": ENGINE_VERSION,
+            "status":        "error",
+            "metrics":       None,
+            "error":         message,
+            "data_features": data_features if data_features is not None else {},
+            "engine":        ENGINE_NAME,
+            "version":       ENGINE_VERSION,
         }

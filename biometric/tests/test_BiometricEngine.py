@@ -490,6 +490,9 @@ class TestProcess:
             "recommended_load",  # added Phase 7.8.0
             "training_advice",   # added Phase 7.9.0
         }
+        # data_features lives at the top level, not inside metrics
+        assert "data_features" in result                    # added Phase 7.10.0
+        assert result["data_features"] == {}                # no data_engine → always {}
 
     def test_5_3_engine_name_correct(self):
         eng = _make_engine()
@@ -548,6 +551,8 @@ class TestProcess:
         eng = _make_engine()
         result = eng.process(_make_valid_input(n=20))
         assert result["status"] == "ok"
+        # top-level data_features must be present and be a dict
+        assert isinstance(result["data_features"], dict)
         for key, val in result["metrics"].items():
             if key == "training_state":
                 assert isinstance(val, str), f"{key} should be str, got {type(val)}"
@@ -1428,7 +1433,10 @@ class TestAnomalyScoring:
             "recommended_load",  # added Phase 7.8.0
             "training_advice",   # added Phase 7.9.0
         }
+        # metrics stays at 12 keys; data_features is top-level (Phase 7.10.0)
         assert set(result["metrics"].keys()) == expected_keys
+        assert "data_features" in result
+        assert result["data_features"] == {}   # no data_engine injected
 
     # ── 13.12  anomaly_score in process() output is finite and in [0, 1] ──────
 
@@ -1439,6 +1447,245 @@ class TestAnomalyScoring:
             score = result["metrics"]["anomaly_score"]
             assert math.isfinite(score), f"n={n}: score not finite"
             assert 0.0 <= score <= 1.0,  f"n={n}: score={score} out of [0, 1]"
+
+
+# =============================================================================
+# SECTION 17 — DataEngine integration (Phase 7.10.0)
+# =============================================================================
+#
+# Coverage map
+# ─────────────
+#   Optional dependency
+#     17.1   BiometricEngine(data_engine=None) is the default — no error
+#     17.2   BiometricEngine(data_engine=<mock>) stores the engine
+#     17.3   data_features always present in output dict (top-level key)
+#
+#   No data_engine → always empty
+#     17.4   data_features == {} when data_engine=None (default)
+#     17.5   data_features == {} when data_engine=None (explicit)
+#     17.6   data_features not inside metrics (metrics key count unchanged)
+#
+#   With data_engine → features populated
+#     17.7   data_features == DataEngine.run()["features"] on success
+#     17.8   data_engine.run() receives {"values": input["load"]}
+#     17.9   data_features is a dict
+#
+#   Fault tolerance
+#     17.10  DataEngine.run() raises → data_features == {}, pipeline ok
+#     17.11  DataEngine.run() returns non-dict → data_features == {}
+#     17.12  DataEngine.run() returns dict with no "features" key → {}
+#     17.13  Biometric pipeline result identical regardless of DataEngine
+#
+#   Input immutability
+#     17.14  Raw input dict not mutated by _extract_data_features
+#     17.15  DataEngine receives a copy of load, not the original list
+#
+#   Error path
+#     17.16  process() error still includes data_features key
+#     17.17  process() error data_features == {} when no data_engine
+#     17.18  process() error data_features == {} even with data_engine
+#             that would succeed (schema error hits before pipeline)
+#
+#   JSON safety
+#     17.19  Whole result (incl. data_features) is JSON-serialisable
+#
+#   Determinism
+#     17.20  100 process() calls → identical data_features each time
+# =============================================================================
+
+
+class _MockDataEngine:
+    """Minimal stub implementing the DataEngine contract."""
+    def run(self, inp: dict) -> dict:
+        return {
+            "status":   "ok",
+            "features": {"mean": 42.0, "std": 1.5, "count": len(inp["values"])},
+        }
+
+
+class _CapturingDataEngine:
+    """Records every payload passed to run()."""
+    def __init__(self):
+        self.calls: list = []
+
+    def run(self, inp: dict) -> dict:
+        self.calls.append({"values": list(inp.get("values", []))})
+        return {"features": {"captured": True}}
+
+
+class _FaultyDataEngine:
+    def run(self, inp: dict) -> dict:
+        raise RuntimeError("simulated DataEngine failure")
+
+
+class _NoFeaturesDataEngine:
+    def run(self, inp: dict) -> dict:
+        return {"status": "ok"}
+
+
+class _BadReturnDataEngine:
+    def run(self, inp: dict):   # type: ignore[return]
+        return "this is not a dict"
+
+
+def _make_engine_with_de() -> BiometricEngine:
+    return BiometricEngine(BiometricConfig(), data_engine=_MockDataEngine())
+
+
+class TestDataEngineIntegration:
+
+    # ── 17.1  default construction still works ────────────────────────────────
+
+    def test_17_1_no_data_engine_default(self):
+        eng = BiometricEngine()
+        result = eng.process(_make_valid_input())
+        assert result["status"] == "ok"
+
+    # ── 17.2  data_engine is stored ───────────────────────────────────────────
+
+    def test_17_2_data_engine_stored(self):
+        de = _MockDataEngine()
+        eng = BiometricEngine(data_engine=de)
+        assert eng._data_engine is de
+
+    # ── 17.3  data_features key always present ────────────────────────────────
+
+    def test_17_3_data_features_always_present(self):
+        for eng in (BiometricEngine(), _make_engine_with_de()):
+            result = eng.process(_make_valid_input())
+            assert "data_features" in result, "data_features key missing"
+
+    # ── 17.4  no data_engine → data_features == {} (default) ─────────────────
+
+    def test_17_4_no_data_engine_default_empty(self):
+        result = BiometricEngine().process(_make_valid_input())
+        assert result["data_features"] == {}
+
+    # ── 17.5  no data_engine → data_features == {} (explicit None) ───────────
+
+    def test_17_5_explicit_none_data_engine_empty(self):
+        result = BiometricEngine(data_engine=None).process(_make_valid_input())
+        assert result["data_features"] == {}
+
+    # ── 17.6  data_features is NOT inside metrics ─────────────────────────────
+
+    def test_17_6_data_features_not_inside_metrics(self):
+        for eng in (BiometricEngine(), _make_engine_with_de()):
+            result = eng.process(_make_valid_input())
+            assert "data_features" not in result["metrics"]
+            assert len(result["metrics"]) == 12
+
+    # ── 17.7  data_features populated from DataEngine on success ─────────────
+
+    def test_17_7_data_features_populated(self):
+        result = _make_engine_with_de().process(_make_valid_input())
+        assert isinstance(result["data_features"], dict)
+        assert len(result["data_features"]) > 0
+
+    # ── 17.8  data_engine.run() receives {"values": input["load"]} ────────────
+
+    def test_17_8_data_engine_receives_load_channel(self):
+        cap = _CapturingDataEngine()
+        raw = _make_valid_input(n=15)
+        BiometricEngine(data_engine=cap).process(raw)
+        assert len(cap.calls) == 1
+        assert cap.calls[0]["values"] == raw["load"]
+
+    # ── 17.9  data_features is a dict ────────────────────────────────────────
+
+    def test_17_9_data_features_is_dict(self):
+        result = _make_engine_with_de().process(_make_valid_input())
+        assert isinstance(result["data_features"], dict)
+
+    # ── 17.10  faulty DataEngine: pipeline still ok, features == {} ───────────
+
+    def test_17_10_faulty_data_engine_fallback(self):
+        eng    = BiometricEngine(data_engine=_FaultyDataEngine())
+        result = eng.process(_make_valid_input())
+        assert result["status"] == "ok"
+        assert result["data_features"] == {}
+
+    # ── 17.11  DataEngine returns non-dict → features == {} ──────────────────
+
+    def test_17_11_non_dict_return_fallback(self):
+        result = BiometricEngine(data_engine=_BadReturnDataEngine()).process(
+            _make_valid_input()
+        )
+        assert result["data_features"] == {}
+
+    # ── 17.12  DataEngine returns dict with no "features" key → {} ───────────
+
+    def test_17_12_missing_features_key_fallback(self):
+        result = BiometricEngine(data_engine=_NoFeaturesDataEngine()).process(
+            _make_valid_input()
+        )
+        assert result["data_features"] == {}
+
+    # ── 17.13  biometric metrics identical with/without DataEngine ─────────────
+
+    def test_17_13_biometric_metrics_unaffected_by_data_engine(self):
+        raw     = _make_valid_input(n=20)
+        without = BiometricEngine().process(raw)
+        with_de = _make_engine_with_de().process(raw)
+        assert without["metrics"] == with_de["metrics"]
+        assert without["status"]  == with_de["status"]
+
+    # ── 17.14  raw input dict not mutated ─────────────────────────────────────
+
+    def test_17_14_raw_input_not_mutated(self):
+        import copy
+        raw  = _make_valid_input(n=12)
+        snap = copy.deepcopy(raw)
+        _make_engine_with_de().process(raw)
+        assert raw == snap
+
+    # ── 17.15  DataEngine receives a copy of load, not the original list ──────
+
+    def test_17_15_data_engine_gets_copy_of_load(self):
+        class _MutatingDE:
+            def run(self, inp: dict) -> dict:
+                inp["values"].clear()
+                return {"features": {}}
+
+        raw       = _make_valid_input(n=10)
+        orig_load = list(raw["load"])
+        BiometricEngine(data_engine=_MutatingDE()).process(raw)
+        assert raw["load"] == orig_load
+
+    # ── 17.16  error path includes data_features key ──────────────────────────
+
+    def test_17_16_error_output_has_data_features(self):
+        result = BiometricEngine().process("not a dict")
+        assert "data_features" in result
+        assert result["status"] == "error"
+
+    # ── 17.17  error + no data_engine → data_features == {} ──────────────────
+
+    def test_17_17_error_no_data_engine_empty_features(self):
+        result = BiometricEngine().process("not a dict")
+        assert result["data_features"] == {}
+
+    # ── 17.18  error + data_engine present → data_features == {} ─────────────
+
+    def test_17_18_error_with_data_engine_empty_features(self):
+        result = _make_engine_with_de().process("not a dict")
+        assert result["data_features"] == {}
+        assert result["status"] == "error"
+
+    # ── 17.19  full result is JSON-serialisable with DataEngine ───────────────
+
+    def test_17_19_json_serialisable(self):
+        result = _make_engine_with_de().process(_make_valid_input())
+        json.dumps(result)
+
+    # ── 17.20  determinism: 100 calls → identical data_features ──────────────
+
+    def test_17_20_data_features_deterministic(self):
+        eng = _make_engine_with_de()
+        raw = _make_valid_input(n=20)
+        first = eng.process(raw)["data_features"]
+        for _ in range(99):
+            assert eng.process(raw)["data_features"] == first
 
 
 # ─────────────────────────────────────────────────────────────────────────────
